@@ -2,13 +2,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from groq import Groq
 import re
 import json
 import os
-
-from groq import Groq
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
+import threading
 import requests as req_lib
 
 app = FastAPI(title="RCDoK Chatbot API")
@@ -20,25 +20,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Groq client
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# ── Model state ──
 embeddings = None
 vectorstore = None
 retriever = None
+models_ready = False
+
+def load_models_background():
+    global embeddings, vectorstore, retriever, models_ready
+    print("Loading vector database in background...")
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        vectorstore = Chroma(
+            persist_directory="./chroma_db",
+            embedding_function=embeddings
+        )
+        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+        models_ready = True
+        print("Models ready.")
+    except Exception as e:
+        print(f"Error loading models: {e}")
 
 @app.on_event("startup")
-async def load_models():
-    global embeddings, vectorstore, retriever
-    print("Loading vector database...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    vectorstore = Chroma(
-        persist_directory="./chroma_db",
-        embedding_function=embeddings
-    )
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-    print("\nReady.")
+async def startup_event():
+    thread = threading.Thread(target=load_models_background, daemon=True)
+    thread.start()
 
 SYSTEM_PROMPT = """You are Kalookan, the official AI assistant of the Roman Catholic Diocese of Kalookan in the Philippines.
 
@@ -82,10 +93,16 @@ class ChatRequest(BaseModel):
     message: str
     history: list = []
 
+# Messenger conversation memory
 messenger_history = {}
 
+# ── Env vars ──
+PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
+VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
+
+
 def keyword_boost(query: str, top_k: int = 3):
-    if vectorstore is None:
+    if not models_ready or vectorstore is None:
         return []
     stop_words = {
         "the","a","an","is","are","what","who","where","when","how",
@@ -110,17 +127,20 @@ def keyword_boost(query: str, top_k: int = 3):
             continue
     return results[:top_k]
 
+
 def score_chunk(chunk: str, query: str) -> int:
     stop_words = {"the","a","an","is","are","of","in","at","for","and","or","to"}
     qw = set(re.findall(r'\w+', query.lower())) - stop_words
     cw = set(re.findall(r'\w+', chunk.lower()))
     return len(qw & cw)
 
+
 def build_context_from_history(history: list) -> str:
     if not history:
         return ""
     recent = history[-4:]
     return " ".join([turn.get("content", "") for turn in recent])
+
 
 def clean_reply(reply: str) -> str:
     leak_phrases = [
@@ -140,7 +160,10 @@ def clean_reply(reply: str) -> str:
     reply = re.sub(r'\*\*?(.*?)\*\*?', r'\1', reply)
     return reply.strip().lstrip(",. ")
 
+
 def retrieve_context(message: str, history: list) -> str:
+    if not models_ready or retriever is None:
+        return ""
     history_context = build_context_from_history(history)
     enriched_query  = message + " " + history_context
     semantic_docs   = retriever.invoke(enriched_query)
@@ -156,12 +179,22 @@ def retrieve_context(message: str, history: list) -> str:
     top_docs = all_docs[:5]
     return "\n\n---\n\n".join([d.page_content for d in top_docs])
 
-# ── Web chat endpoint ──
+
+# ── Web chat endpoint (streaming) ──
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    if not models_ready:
+        def loading_stream():
+            msg = "The assistant is still warming up, please try again in 30 seconds."
+            yield json.dumps({"token": msg}) + "\n"
+            yield json.dumps({"done": True, "full": msg}) + "\n"
+        return StreamingResponse(loading_stream(), media_type="application/x-ndjson")
+
     context = retrieve_context(request.message, request.history)
 
+    print(f"\n{'='*50}")
     print(f"USER: '{request.message}'")
+    print(f"{'='*50}\n")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
     for turn in request.history[-6:]:
@@ -184,17 +217,15 @@ async def chat(request: ChatRequest):
                     full_reply += token
                     yield json.dumps({"token": token}) + "\n"
         except Exception as e:
-            yield json.dumps({"token": f" Sorry, something went wrong: {str(e)}"}) + "\n"
+            yield json.dumps({"token": " Sorry, something went wrong. Please try again."}) + "\n"
 
         cleaned = clean_reply(full_reply)
         yield json.dumps({"done": True, "full": cleaned}) + "\n"
 
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
-# ── Messenger webhook ──
-PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
-VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
 
+# ── Messenger helpers ──
 def send_messenger_reply(recipient_id: str, text: str):
     url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
     req_lib.post(url, json={
@@ -210,6 +241,8 @@ def send_typing(recipient_id: str):
         "sender_action": "typing_on"
     })
 
+
+# ── Messenger webhook ──
 @app.get("/webhook")
 async def verify_webhook(
     hub_mode: str = None,
@@ -229,6 +262,14 @@ async def receive_message(request_obj: Request):
             if "message" in event and "text" in event["message"]:
                 user_text = event["message"]["text"]
                 send_typing(sender_id)
+
+                if not models_ready:
+                    send_messenger_reply(
+                        sender_id,
+                        "The assistant is still warming up. Please send your message again in 30 seconds."
+                    )
+                    continue
+
                 history = messenger_history.get(sender_id, [])
                 context = retrieve_context(user_text, history)
                 messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
@@ -243,19 +284,22 @@ async def receive_message(request_obj: Request):
                         temperature=0.3,
                     )
                     reply = clean_reply(response.choices[0].message.content)
-                except Exception as e:
+                except Exception:
                     reply = "Sorry, something went wrong. Please try again later."
-                history.append({"role": "user",     "content": user_text})
-                history.append({"role": "assistant", "content": reply})
+
+                history.append({"role": "user",      "content": user_text})
+                history.append({"role": "assistant",  "content": reply})
                 messenger_history[sender_id] = history[-12:]
                 send_messenger_reply(sender_id, reply)
+
     return {"status": "ok"}
 
+
+# ── Health check ──
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "gemma2-9b-it via groq"}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    return {
+        "status": "ok",
+        "model": "gemma2-9b-it via groq",
+        "models_ready": models_ready
+    }
