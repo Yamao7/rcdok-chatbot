@@ -1,12 +1,13 @@
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-import ollama
+from groq import Groq
 import re
 import json
+import os
 
 app = FastAPI(title="RCDoK Chatbot API")
 
@@ -16,6 +17,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Groq client — reads API key from environment variable
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 print("Loading vector database...")
 embeddings = HuggingFaceEmbeddings(
@@ -53,19 +57,17 @@ CONVERSATION RULES:
 1. Always read the full conversation history — understand what has already been discussed
 2. When the user answers your follow-up, continue on that same topic — never repeat the question
 3. Never repeat something already said in the same conversation unless asked
-4. Short replies like "yes", "San Roque", "Sunday" are answers to your previous question — treat them as such and respond accordingly
-5. Only ask a follow-up question when the question is genuinely too vague to answer — for example "which parish?" when no parish was specified
+4. Short replies like "yes", "San Roque", "Sunday" are answers to your previous question — treat them as such
+5. Only ask a follow-up question when the question is genuinely too vague to answer
 6. Never ask a follow-up for questions about mass schedules, addresses, contacts, clergy names, schools, missions, cemeteries, history, prayers, saints, sacraments, or general knowledge — answer these directly
 
 ANSWERING RULES:
-1. For diocese-specific questions — use the diocesan information provided and answer completely with all details: names, addresses, schedules, contacts, history
-2. For Catholic faith questions — draw on your full knowledge of Catholic theology, tradition, and teaching
-3. For general knowledge questions — answer helpfully and accurately from your broad knowledge
-4. For diocese questions where information is only partial — give the closest answer you can find, never refuse to answer
-5. When you truly have no information about a diocese-specific detail — say warmly: "I'm sorry, I don't seem to have that specific information right now. You may want to contact the Diocese of Kalookan directly for assistance."
-6. Never make up diocesan facts — only use the diocesan information provided below for diocese-specific details
-7. For non-diocese questions, use your general knowledge freely and helpfully
-8. Keep answers concise but complete — include every relevant detail when answering about the diocese
+1. For diocese-specific questions — use the diocesan information provided and answer completely
+2. For Catholic faith questions — draw on your full knowledge of Catholic theology and tradition
+3. For general knowledge questions — answer helpfully and accurately
+4. When you truly have no information about a diocese-specific detail — say warmly: "I'm sorry, I don't seem to have that specific information right now. You may want to contact the Diocese of Kalookan directly for assistance."
+5. Never make up diocesan facts — only use the diocesan information provided below for diocese-specific details
+6. Keep answers concise but complete — include every relevant detail when answering about the diocese
 
 DIOCESAN INFORMATION:
 {context}"""
@@ -73,6 +75,9 @@ DIOCESAN INFORMATION:
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+
+# ── Messenger webhook also uses this ──
+messenger_history = {}
 
 def keyword_boost(query: str, top_k: int = 3):
     stop_words = {
@@ -125,18 +130,14 @@ def clean_reply(reply: str) -> str:
             idx = reply_lower.find(phrase)
             reply = reply[:idx] + reply[idx + len(phrase):]
             reply_lower = reply.lower()
-    # Remove markdown bold/italic
     reply = re.sub(r'\*\*?(.*?)\*\*?', r'\1', reply)
     return reply.strip().lstrip(",. ")
 
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    history_context = build_context_from_history(request.history)
-    enriched_query  = request.message + " " + history_context
-
-    semantic_docs = retriever.invoke(enriched_query)
-    keyword_docs  = keyword_boost(enriched_query)
-
+def retrieve_context(message: str, history: list) -> str:
+    history_context = build_context_from_history(history)
+    enriched_query  = message + " " + history_context
+    semantic_docs   = retriever.invoke(enriched_query)
+    keyword_docs    = keyword_boost(enriched_query)
     seen = set()
     all_docs = []
     for doc in (semantic_docs + keyword_docs):
@@ -144,54 +145,110 @@ async def chat(request: ChatRequest):
         if key not in seen:
             seen.add(key)
             all_docs.append(doc)
-
     all_docs.sort(key=lambda d: score_chunk(d.page_content, enriched_query), reverse=True)
     top_docs = all_docs[:5]
-    context  = "\n\n---\n\n".join([d.page_content for d in top_docs])
+    return "\n\n---\n\n".join([d.page_content for d in top_docs])
+
+# ── Web chat endpoint (streaming) ──
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    context = retrieve_context(request.message, request.history)
 
     print(f"\n{'='*50}")
     print(f"USER: '{request.message}'")
-    print(f"CHUNKS: {len(top_docs)}")
     print(f"{'='*50}\n")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
-
     for turn in request.history[-6:]:
         messages.append(turn)
-
     messages.append({"role": "user", "content": request.message})
 
     def stream_response():
         full_reply = ""
         try:
-            stream = ollama.chat(
-                model="gemma2:2b-instruct-q4_K_M",
+            stream = client.chat.completions.create(
+                model="gemma2-9b-it",
                 messages=messages,
+                max_tokens=350,
+                temperature=0.3,
                 stream=True,
-                options={
-                    "num_predict": 350,
-                    "temperature": 0.3,
-                    "num_ctx":     3500,
-                    "repeat_penalty": 1.15,
-                    "top_k":       30,
-                    "top_p":       0.9,
-                }
             )
             for chunk in stream:
-                token = chunk["message"]["content"]
-                full_reply += token
-                # Stream each token as a JSON line
-                yield json.dumps({"token": token}) + "\n"
-
+                token = chunk.choices[0].delta.content or ""
+                if token:
+                    full_reply += token
+                    yield json.dumps({"token": token}) + "\n"
         except Exception as e:
             yield json.dumps({"token": " Sorry, something went wrong. Please try again."}) + "\n"
 
-        # Send final cleaned signal
         cleaned = clean_reply(full_reply)
         yield json.dumps({"done": True, "full": cleaned}) + "\n"
 
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
+# ── Messenger webhook ──
+import requests as req_lib
+
+PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
+VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
+
+def send_messenger_reply(recipient_id: str, text: str):
+    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    req_lib.post(url, json={
+        "recipient": {"id": recipient_id},
+        "message":   {"text": text},
+        "messaging_type": "RESPONSE"
+    })
+
+def send_typing(recipient_id: str):
+    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    req_lib.post(url, json={
+        "recipient":     {"id": recipient_id},
+        "sender_action": "typing_on"
+    })
+
+@app.get("/webhook")
+async def verify_webhook(
+    hub_mode: str = None,
+    hub_verify_token: str = None,
+    hub_challenge: str = None
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return int(hub_challenge)
+    return {"error": "Verification failed"}
+
+@app.post("/webhook")
+async def receive_message(request_obj):
+    from fastapi import Request
+    body = await request_obj.json()
+    for entry in body.get("entry", []):
+        for event in entry.get("messaging", []):
+            sender_id = event["sender"]["id"]
+            if "message" in event and "text" in event["message"]:
+                user_text = event["message"]["text"]
+                send_typing(sender_id)
+                history = messenger_history.get(sender_id, [])
+                context = retrieve_context(user_text, history)
+                messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
+                for turn in history[-6:]:
+                    messages.append(turn)
+                messages.append({"role": "user", "content": user_text})
+                try:
+                    response = client.chat.completions.create(
+                        model="gemma2-9b-it",
+                        messages=messages,
+                        max_tokens=350,
+                        temperature=0.3,
+                    )
+                    reply = clean_reply(response.choices[0].message.content)
+                except Exception:
+                    reply = "Sorry, something went wrong. Please try again later."
+                history.append({"role": "user",      "content": user_text})
+                history.append({"role": "assistant",  "content": reply})
+                messenger_history[sender_id] = history[-12:]
+                send_messenger_reply(sender_id, reply)
+    return {"status": "ok"}
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "gemma2:2b-instruct-q4_K_M"}
+    return {"status": "ok", "model": "gemma2-9b-it via groq"}
