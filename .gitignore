@@ -4,3 +4,4 @@ __pycache__/
 .env
 tempCodeRunnerFile.py
 filepath.py
+chroma_db/
