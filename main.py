@@ -22,19 +22,23 @@ app.add_middleware(
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-print("Loading embeddings...")
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+embeddings = None
+vectorstore = None
+retriever = None
 
-print("Loading chroma...")
-vectorstore = Chroma(
-    persist_directory="./chroma_db",
-    embedding_function=embeddings
-)
-
-retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-print("Ready.")
+@app.on_event("startup")
+async def load_models():
+    global embeddings, vectorstore, retriever
+    print("Loading vector database...")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    vectorstore = Chroma(
+        persist_directory="./chroma_db",
+        embedding_function=embeddings
+    )
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    print("\nReady.")
 
 SYSTEM_PROMPT = """You are Kalookan, the official AI assistant of the Roman Catholic Diocese of Kalookan in the Philippines.
 
@@ -81,6 +85,8 @@ class ChatRequest(BaseModel):
 messenger_history = {}
 
 def keyword_boost(query: str, top_k: int = 3):
+    if vectorstore is None:
+        return []
     stop_words = {
         "the","a","an","is","are","what","who","where","when","how",
         "does","do","of","in","at","for","and","or","to","can","tell",
@@ -248,3 +254,8 @@ async def receive_message(request_obj: Request):
 @app.get("/health")
 def health():
     return {"status": "ok", "model": "gemma2-9b-it via groq"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
