@@ -9,7 +9,9 @@ from pydantic import BaseModel
 from groq import Groq
 from rank_bm25 import BM25Okapi
 
+
 app = FastAPI(title="RCDoK Chatbot API")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,18 +20,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# ── Build BM25 index at startup (takes ~0.5s, uses ~5MB RAM) ──
+
+# ── Build BM25 index at startup ──
 KB_DIR = Path("./knowledge_base")
 
-# Each entry: {"filename": str, "content": str, "tokens": list}
 _docs: list[dict] = []
 _bm25: BM25Okapi | None = None
 
+
 def _tokenize(text: str) -> list[str]:
-    """Lowercase, strip punctuation, split on whitespace."""
     return re.findall(r"[a-z0-9]+", text.lower())
+
 
 def build_index():
     global _bm25, _docs
@@ -53,12 +57,11 @@ def build_index():
     _bm25 = BM25Okapi(corpus_tokens)
     print(f"BM25 index ready — {len(_docs)} documents loaded.")
 
-# Build synchronously at import time (fast enough, no threading needed)
+
 build_index()
 
 
 def retrieve(query: str, top_k: int = 5) -> str:
-    """Return the top_k most relevant document chunks joined as context."""
     if _bm25 is None or not _docs:
         return ""
 
@@ -68,21 +71,18 @@ def retrieve(query: str, top_k: int = 5) -> str:
 
     scores = _bm25.get_scores(tokens)
 
-    # Pair each doc with its score, sort descending, take top_k
     ranked = sorted(
-        enumerate(scores), key=lambda x: x, reverse=True
+        enumerate(scores), key=lambda x: x[1], reverse=True
     )[:top_k]
 
-    # Only include docs with a non-zero score
     relevant = [
-        _docs[i] ["content"]
+        _docs[i]["content"]
         for i, score in ranked
         if score > 0
     ]
 
     if not relevant:
-        # Fall back: return first 3 docs (general info)
-        relevant = [_docs[i] ["content"] for i in range(min(3, len(_docs)))]
+        relevant = [_docs[i]["content"] for i in range(min(3, len(_docs)))]
 
     return "\n\n---\n\n".join(relevant)
 
@@ -141,7 +141,6 @@ def clean_reply(reply: str) -> str:
             idx = reply_lower.find(phrase)
             reply = reply[:idx] + reply[idx + len(phrase):]
             reply_lower = reply.lower()
-    # Strip markdown bold/italic markers
     reply = re.sub(r"\*\*?(.*?)\*\*?", r"\1", reply)
     return reply.strip().lstrip(",. ")
 
@@ -158,7 +157,6 @@ async def chat(request: ChatRequest):
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT.format(context=context)}
     ]
-    # Include last 6 turns of history for context without bloating the prompt
     for turn in request.history[-6:]:
         messages.append(turn)
     messages.append({"role": "user", "content": request.message})
@@ -167,18 +165,19 @@ async def chat(request: ChatRequest):
         full_reply = ""
         try:
             stream = client.chat.completions.create(
-                model="gemma2-9b-it",
+                model="llama-3.1-70b-versatile",
                 messages=messages,
                 max_tokens=350,
                 temperature=0.3,
                 stream=True,
             )
             for chunk in stream:
-                token = chunk.choices.delta.content or ""
+                token = chunk.choices[0].delta.content or ""
                 if token:
                     full_reply += token
                     yield json.dumps({"token": token}) + "\n"
         except Exception as e:
+            print(f"STREAM ERROR: {e}")
             error_msg = "Sorry, something went wrong. Please try again."
             yield json.dumps({"token": error_msg}) + "\n"
             yield json.dumps({"done": True, "full": error_msg}) + "\n"
@@ -194,6 +193,6 @@ async def chat(request: ChatRequest):
 def health():
     return {
         "status": "ok",
-        "model": "gemma2-9b-it via groq",
+        "model": "llama-3.1-70b-versatile via groq",
         "docs_indexed": len(_docs),
     }
