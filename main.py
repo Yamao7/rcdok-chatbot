@@ -1,15 +1,13 @@
-from fastapi import FastAPI, Request
+import os
+import json
+import re
+from pathlib import Path
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 from groq import Groq
-import re
-import json
-import os
-import threading
-import requests as req_lib
+from rank_bm25 import BM25Okapi
 
 app = FastAPI(title="RCDoK Chatbot API")
 
@@ -20,36 +18,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Groq client
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# ── Model state ──
-embeddings = None
-vectorstore = None
-retriever = None
-models_ready = False
+# ── Build BM25 index at startup (takes ~0.5s, uses ~5MB RAM) ──
+KB_DIR = Path("./knowledge_base")
 
-def load_models_background():
-    global embeddings, vectorstore, retriever, models_ready
-    print("Loading vector database in background...")
-    try:
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        vectorstore = Chroma(
-            persist_directory="./chroma_db",
-            embedding_function=embeddings
-        )
-        retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-        models_ready = True
-        print("Models ready.")
-    except Exception as e:
-        print(f"Error loading models: {e}")
+# Each entry: {"filename": str, "content": str, "tokens": list}
+_docs: list[dict] = []
+_bm25: BM25Okapi | None = None
 
-@app.on_event("startup")
-async def startup_event():
-    thread = threading.Thread(target=load_models_background, daemon=True)
-    thread.start()
+def _tokenize(text: str) -> list[str]:
+    """Lowercase, strip punctuation, split on whitespace."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def build_index():
+    global _bm25, _docs
+    _docs = []
+    for path in sorted(KB_DIR.glob("**/*.txt")):
+        try:
+            content = path.read_text(encoding="utf-8")
+            _docs.append({
+                "filename": path.name,
+                "content": content,
+                "tokens": _tokenize(content),
+            })
+        except Exception as e:
+            print(f"  Warning: could not read {path.name}: {e}")
+
+    if not _docs:
+        print("WARNING: No documents found in knowledge_base/")
+        return
+
+    corpus_tokens = [d["tokens"] for d in _docs]
+    _bm25 = BM25Okapi(corpus_tokens)
+    print(f"BM25 index ready — {len(_docs)} documents loaded.")
+
+# Build synchronously at import time (fast enough, no threading needed)
+build_index()
+
+
+def retrieve(query: str, top_k: int = 5) -> str:
+    """Return the top_k most relevant document chunks joined as context."""
+    if _bm25 is None or not _docs:
+        return ""
+
+    tokens = _tokenize(query)
+    if not tokens:
+        return ""
+
+    scores = _bm25.get_scores(tokens)
+
+    # Pair each doc with its score, sort descending, take top_k
+    ranked = sorted(
+        enumerate(scores), key=lambda x: x, reverse=True
+    )[:top_k]
+
+    # Only include docs with a non-zero score
+    relevant = [
+        _docs[i] ["content"]
+        for i, score in ranked
+        if score > 0
+    ]
+
+    if not relevant:
+        # Fall back: return first 3 docs (general info)
+        relevant = [_docs[i] ["content"] for i in range(min(3, len(_docs)))]
+
+    return "\n\n---\n\n".join(relevant)
+
 
 SYSTEM_PROMPT = """You are Kalookan, the official AI assistant of the Roman Catholic Diocese of Kalookan in the Philippines.
 
@@ -58,7 +94,7 @@ You are highly intelligent and knowledgeable — both about the Diocese of Kaloo
 YOUR KNOWLEDGE:
 - You are an expert on the Roman Catholic Diocese of Kalookan — its parishes, clergy, schools, missions, cemeteries, history, and diocesan life across Caloocan, Malabon, and Navotas
 - You have deep knowledge of Catholic faith, theology, tradition, sacraments, prayers, liturgy, saints, the Bible, Church history, and the teachings of the Magisterium
-- You are also knowledgeable about general topics — history, science, culture, Filipino life, current events up to your knowledge cutoff — and can answer these helpfully
+- You are also knowledgeable about general topics — history, science, culture, Filipino life — and can answer these helpfully
 - When a question is about the diocese specifically, always prioritize the diocesan information below
 - When a question is outside the diocese but related to Catholicism or general knowledge, answer from your broad knowledge
 
@@ -89,67 +125,15 @@ ANSWERING RULES:
 DIOCESAN INFORMATION:
 {context}"""
 
-class ChatRequest(BaseModel):
-    message: str
-    history: list = []
-
-# Messenger conversation memory
-messenger_history = {}
-
-# ── Env vars ──
-PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
-VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
-
-
-def keyword_boost(query: str, top_k: int = 3):
-    if not models_ready or vectorstore is None:
-        return []
-    stop_words = {
-        "the","a","an","is","are","what","who","where","when","how",
-        "does","do","of","in","at","for","and","or","to","can","tell",
-        "me","about","please","its","it","my","our","your","their","i",
-        "was","be","been","has","have","had","will","would","could","should",
-        "give","list","show","find","get","know","need","want","po","ba","ang"
-    }
-    words = [w for w in re.findall(r'\w+', query.lower())
-             if w not in stop_words and len(w) > 2]
-    seen = set()
-    results = []
-    for word in words[:5]:
-        try:
-            hits = vectorstore.similarity_search(word, k=2)
-            for doc in hits:
-                key = doc.page_content[:80]
-                if key not in seen:
-                    seen.add(key)
-                    results.append(doc)
-        except Exception:
-            continue
-    return results[:top_k]
-
-
-def score_chunk(chunk: str, query: str) -> int:
-    stop_words = {"the","a","an","is","are","of","in","at","for","and","or","to"}
-    qw = set(re.findall(r'\w+', query.lower())) - stop_words
-    cw = set(re.findall(r'\w+', chunk.lower()))
-    return len(qw & cw)
-
-
-def build_context_from_history(history: list) -> str:
-    if not history:
-        return ""
-    recent = history[-4:]
-    return " ".join([turn.get("content", "") for turn in recent])
-
 
 def clean_reply(reply: str) -> str:
     leak_phrases = [
-        "based on the context","according to the context",
-        "the provided text","the context provided",
-        "in the information given","the database",
-        "the knowledge base","provided context",
+        "based on the context", "according to the context",
+        "the provided text", "the context provided",
+        "in the information given", "the database",
+        "the knowledge base", "provided context",
         "based on the information provided",
-        "the information provided","the diocesan information",
+        "the information provided", "the diocesan information",
     ]
     reply_lower = reply.lower()
     for phrase in leak_phrases:
@@ -157,46 +141,24 @@ def clean_reply(reply: str) -> str:
             idx = reply_lower.find(phrase)
             reply = reply[:idx] + reply[idx + len(phrase):]
             reply_lower = reply.lower()
-    reply = re.sub(r'\*\*?(.*?)\*\*?', r'\1', reply)
+    # Strip markdown bold/italic markers
+    reply = re.sub(r"\*\*?(.*?)\*\*?", r"\1", reply)
     return reply.strip().lstrip(",. ")
 
 
-def retrieve_context(message: str, history: list) -> str:
-    if not models_ready or retriever is None:
-        return ""
-    history_context = build_context_from_history(history)
-    enriched_query  = message + " " + history_context
-    semantic_docs   = retriever.invoke(enriched_query)
-    keyword_docs    = keyword_boost(enriched_query)
-    seen = set()
-    all_docs = []
-    for doc in (semantic_docs + keyword_docs):
-        key = doc.page_content[:100]
-        if key not in seen:
-            seen.add(key)
-            all_docs.append(doc)
-    all_docs.sort(key=lambda d: score_chunk(d.page_content, enriched_query), reverse=True)
-    top_docs = all_docs[:5]
-    return "\n\n---\n\n".join([d.page_content for d in top_docs])
+class ChatRequest(BaseModel):
+    message: str
+    history: list = []
 
 
-# ── Web chat endpoint (streaming) ──
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    if not models_ready:
-        def loading_stream():
-            msg = "The assistant is still warming up, please try again in 30 seconds."
-            yield json.dumps({"token": msg}) + "\n"
-            yield json.dumps({"done": True, "full": msg}) + "\n"
-        return StreamingResponse(loading_stream(), media_type="application/x-ndjson")
+    context = retrieve(request.message)
 
-    context = retrieve_context(request.message, request.history)
-
-    print(f"\n{'='*50}")
-    print(f"USER: '{request.message}'")
-    print(f"{'='*50}\n")
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT.format(context=context)}
+    ]
+    # Include last 6 turns of history for context without bloating the prompt
     for turn in request.history[-6:]:
         messages.append(turn)
     messages.append({"role": "user", "content": request.message})
@@ -212,12 +174,15 @@ async def chat(request: ChatRequest):
                 stream=True,
             )
             for chunk in stream:
-                token = chunk.choices[0].delta.content or ""
+                token = chunk.choices.delta.content or ""
                 if token:
                     full_reply += token
                     yield json.dumps({"token": token}) + "\n"
         except Exception as e:
-            yield json.dumps({"token": " Sorry, something went wrong. Please try again."}) + "\n"
+            error_msg = "Sorry, something went wrong. Please try again."
+            yield json.dumps({"token": error_msg}) + "\n"
+            yield json.dumps({"done": True, "full": error_msg}) + "\n"
+            return
 
         cleaned = clean_reply(full_reply)
         yield json.dumps({"done": True, "full": cleaned}) + "\n"
@@ -225,81 +190,10 @@ async def chat(request: ChatRequest):
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
 
-# ── Messenger helpers ──
-def send_messenger_reply(recipient_id: str, text: str):
-    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
-    req_lib.post(url, json={
-        "recipient": {"id": recipient_id},
-        "message":   {"text": text},
-        "messaging_type": "RESPONSE"
-    })
-
-def send_typing(recipient_id: str):
-    url = f"https://graph.facebook.com/v19.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
-    req_lib.post(url, json={
-        "recipient":     {"id": recipient_id},
-        "sender_action": "typing_on"
-    })
-
-
-# ── Messenger webhook ──
-@app.get("/webhook")
-async def verify_webhook(
-    hub_mode: str = None,
-    hub_verify_token: str = None,
-    hub_challenge: str = None
-):
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return int(hub_challenge)
-    return {"error": "Verification failed"}
-
-@app.post("/webhook")
-async def receive_message(request_obj: Request):
-    body = await request_obj.json()
-    for entry in body.get("entry", []):
-        for event in entry.get("messaging", []):
-            sender_id = event["sender"]["id"]
-            if "message" in event and "text" in event["message"]:
-                user_text = event["message"]["text"]
-                send_typing(sender_id)
-
-                if not models_ready:
-                    send_messenger_reply(
-                        sender_id,
-                        "The assistant is still warming up. Please send your message again in 30 seconds."
-                    )
-                    continue
-
-                history = messenger_history.get(sender_id, [])
-                context = retrieve_context(user_text, history)
-                messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}]
-                for turn in history[-6:]:
-                    messages.append(turn)
-                messages.append({"role": "user", "content": user_text})
-                try:
-                    response = client.chat.completions.create(
-                        model="gemma2-9b-it",
-                        messages=messages,
-                        max_tokens=350,
-                        temperature=0.3,
-                    )
-                    reply = clean_reply(response.choices[0].message.content)
-                except Exception:
-                    reply = "Sorry, something went wrong. Please try again later."
-
-                history.append({"role": "user",      "content": user_text})
-                history.append({"role": "assistant",  "content": reply})
-                messenger_history[sender_id] = history[-12:]
-                send_messenger_reply(sender_id, reply)
-
-    return {"status": "ok"}
-
-
-# ── Health check ──
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "model": "gemma2-9b-it via groq",
-        "models_ready": models_ready
+        "docs_indexed": len(_docs),
     }
