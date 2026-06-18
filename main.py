@@ -165,7 +165,7 @@ async def chat(request: ChatRequest):
         full_reply = ""
         try:
             stream = client.chat.completions.create(
-                model="llama-3.1-70b-versatile",
+                model="llama-3.1-8b-instant",
                 messages=messages,
                 max_tokens=350,
                 temperature=0.3,
@@ -193,6 +193,6 @@ async def chat(request: ChatRequest):
 def health():
     return {
         "status": "ok",
-        "model": "llama-3.1-70b-versatile via groq",
+        "model": "llama-3.1-8b-instant via groq",
         "docs_indexed": len(_docs),
     }
