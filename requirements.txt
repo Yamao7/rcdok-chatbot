@@ -1,5 +1,7 @@
+rank-bm25
+groq
 fastapi
 uvicorn[standard]
-groq
 requests
-rank-bm25
+beautifulsoup4
+pydantic
