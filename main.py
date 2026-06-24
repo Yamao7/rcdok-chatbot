@@ -1,3 +1,5 @@
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +8,13 @@ from groq import Groq, RateLimitError
 from rank_bm25 import BM25Okapi
 import os, re, json, time, glob, requests as req_lib
 
+
 app = FastAPI(title="RCDoK Chatbot API")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+def index():
+    return FileResponse("static/index.html")
 
 app.add_middleware(
     CORSMiddleware,

@@ -1151,7 +1151,7 @@
     const msgBody=botDiv.querySelector('.msg-body');
 
     try{
-      const res=await fetch('https://rcdok-chatbot.onrender.com/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history}),signal:abortCtrl.signal});
+      const res=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text,history}),signal:abortCtrl.signal});
       const reader=res.body.getReader();const decoder=new TextDecoder();let buffer='';
 
       while(true){
