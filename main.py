@@ -20,7 +20,7 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL  = "llama-3.1-8b-instant"
 
 MAX_CONTEXT_CHARS = 4000
-MAX_TOKENS_OUT    = 1000
+MAX_TOKENS_OUT    = 650
 MAX_HISTORY_TURNS = 4
 
 print("Loading knowledge base...")
@@ -33,8 +33,8 @@ for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
             raw = f.read().strip()
         name = os.path.splitext(os.path.basename(path))[0]
         # larger chunks (500 chars, 100 overlap) so names/titles stay together
-        step = 400
-        size = 500
+        step = 500
+        size = 1000
         for i in range(0, max(1, len(raw) - 100), step):
             chunk = raw[i : i + size].strip()
             if len(chunk) > 40:

@@ -22,11 +22,8 @@ print(f"Loaded {len(documents)} documents")
 print("Splitting into chunks...")
 splitter = RecursiveCharacterTextSplitter(
     # 600 chars = each chunk covers roughly one topic section
-    # (one parish's schedule, one priest's info, one school's details)
-    # This is the sweet spot for Gemma 2b — specific enough to retrieve
-    # exactly what's needed, small enough to not confuse the model.
-    chunk_size=600,
-    chunk_overlap=150,
+    chunk_size=1000,
+    chunk_overlap=500,
     separators=["\n\n", "\n", ". ", " "]
 )
 chunks = splitter.split_documents(documents)
