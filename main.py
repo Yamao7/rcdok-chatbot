@@ -20,7 +20,7 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL  = "llama-3.1-8b-instant"
 
 MAX_CONTEXT_CHARS = 4000
-MAX_TOKENS_OUT    = 600
+MAX_TOKENS_OUT    = 1000
 MAX_HISTORY_TURNS = 4
 
 print("Loading knowledge base...")
@@ -137,7 +137,7 @@ def clean(reply: str) -> str:
     reply = reply.strip().lstrip(",. ")
 
     # fix numbered lists: "1. Name"  newline before each item
-    reply = re.sub(r"(?<!\n)(\d+\.)\s+", r"\n\1 ", reply)
+    reply = re.sub(r"(?<!\n)(\d+\.) +", r"\n\1 ", reply)
     return reply.strip()
 
 SYSTEM_PROMPT = """\

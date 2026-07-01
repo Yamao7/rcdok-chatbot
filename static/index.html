@@ -1165,11 +1165,14 @@
             if(data.token!==undefined){
               if(!streamStarted){typing.remove();col.appendChild(botDiv);streamStarted=true;}
               fullReply+=data.token;
-              msgBody.textContent=fullReply.replace(/\*\*?(.*?)\*\*?/g,'$1');
+              msgBody.innerHTML=fullReply
+              .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+              .replace(/\*\*?(.*?)\*\*?/g,"$1")
+              .replace(/\n/g,"<br>");
               chatWrap.scrollTop=chatWrap.scrollHeight;
             }
             if(data.done){
-              msgBody.textContent=data.full;
+              msgBody.innerHTML=formatMsg(data.full);
               msgBody.classList.remove('streaming');
               playSound('bell');
               history.push({role:'user',content:text});
@@ -1194,10 +1197,18 @@
 
   function addDateDiv(){const d=document.createElement('div');d.className='date-div';d.textContent=new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});col.appendChild(d);}
 
+  function formatMsg(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>");
+}
+
   function addMsg(text,who){
     const div=document.createElement('div');div.className='message '+who;
     if(who==='bot'){
-      div.innerHTML=`<div class="bot-meta"><div class="bot-lbl">RCDoK Assistant</div><button class="cpybtn" onclick="copyMsg(this)"><svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>Copy</button></div><div class="msg-body">${esc(text)}</div>`;
+      div.innerHTML=`<div class="bot-meta"><div class="bot-lbl">RCDoK Assistant</div><button class="cpybtn" onclick="copyMsg(this)"><svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>Copy</button></div><div class="msg-body">${formatMsg(text)}</div>`;
     }else{div.innerHTML = text
   .replace(/&/g, "&amp;")
   .replace(/</g, "&lt;")
