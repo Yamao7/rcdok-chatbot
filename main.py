@@ -19,8 +19,8 @@ app.add_middleware(
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL  = "llama-3.1-8b-instant"
 
-MAX_CONTEXT_CHARS = 3500
-MAX_TOKENS_OUT    = 500
+MAX_CONTEXT_CHARS = 4000
+MAX_TOKENS_OUT    = 600
 MAX_HISTORY_TURNS = 4
 
 print("Loading knowledge base...")
@@ -32,8 +32,11 @@ for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
         with open(path, encoding="utf-8") as f:
             raw = f.read().strip()
         name = os.path.splitext(os.path.basename(path))[0]
-        for i in range(0, max(1, len(raw) - 50), 250):
-            chunk = raw[i : i + 300].strip()
+        # larger chunks (500 chars, 100 overlap) so names/titles stay together
+        step = 400
+        size = 500
+        for i in range(0, max(1, len(raw) - 100), step):
+            chunk = raw[i : i + size].strip()
             if len(chunk) > 40:
                 _docs.append({"text": chunk, "name": name})
     except Exception as e:
@@ -51,9 +54,26 @@ STOP = {
     "know","need","want","po","ba","ang","mga","na","ng","sa","si","ni",
 }
 
+QUERY_EXPAND = {
+    "priests":          "clergy fr father bishop vicar rector diocesan",
+    "diocesan priests": "clergy fr father bishop vicar rector diocesan",
+    "parish priests":   "clergy fr father bishop vicar rector parish",
+    "mission centers":  "missions center location address headquarters",
+    "mission":          "missions center location address headquarters",
+    "schools":          "school member education college academy",
+    "cemeteries":       "cemetery columbary ossuary burial",
+}
+
 def retrieve(query: str, history: list) -> str:
+    query_lower = query.lower()
+    expanded    = query
+    for key, expansion in QUERY_EXPAND.items():
+        if key in query_lower:
+            expanded = query + " " + expansion
+            break
+
     tail     = " ".join(t.get("content", "") for t in history[-4:])
-    enriched = (query + " " + tail).strip()
+    enriched = (expanded + " " + tail).strip()
     tokens   = [w for w in re.findall(r"\w+", enriched.lower()) if w not in STOP and len(w) > 2]
     if not tokens:
         return ""
@@ -63,7 +83,7 @@ def retrieve(query: str, history: list) -> str:
 
     seen, chunks, total = set(), [], 0
     for idx in indices:
-        if scores[idx] < 0.01:
+        if scores[idx] < 0.001:
             break
         text = _docs[idx]["text"]
         key  = text[:60]
@@ -74,7 +94,7 @@ def retrieve(query: str, history: list) -> str:
             break
         chunks.append(text)
         total += len(text)
-        if len(chunks) >= 5:
+        if len(chunks) >= 6:
             break
 
     return "\n\n---\n\n".join(chunks)
@@ -98,44 +118,45 @@ def groq_call(messages: list, stream: bool = False):
         except Exception:
             raise
 
-LEAK_PHRASES = [
-    "based on the context","according to the context","the provided text",
-    "the context provided","in the information given","the knowledge base",
-    "provided context","based on the information provided",
-    "the information provided","the diocesan information","based on the provided",
-]
+# strip entire sentence if it contains a leak phrase cleaner than substring removal
+_LEAK_RE = re.compile(
+    r'[^.!?]*(?:based on the context|according to the context|the provided text|'
+    r'the context provided|in the information given|the knowledge base|provided context|'
+    r'based on the information provided|the information provided|the diocesan information|'
+    r'based on the provided|in the context|from the context|the context does not|'
+    r'the context only|not listed in|not mentioned in|not included in|not specified in|'
+    r'not found in|not available in)[^.!?]*[.!?]?',
+    re.IGNORECASE
+)
 
 def clean(reply: str) -> str:
-    low = reply.lower()
-    for phrase in LEAK_PHRASES:
-        if phrase in low:
-            idx   = low.find(phrase)
-            reply = reply[:idx] + reply[idx + len(phrase):]
-            low   = reply.lower()
+    reply = _LEAK_RE.sub("", reply)
     reply = re.sub(r"\*\*?(.*?)\*\*?", r"\1", reply)
-    reply = re.sub(r"#{1,6}\s*", "", reply)
-    reply = re.sub(r"(\d+)\.\s+", r"\n\1. ", reply)
-    reply = re.sub(r"\n{3,}", "\n\n", reply)
-    return reply.strip().lstrip(",. ")
+    reply = re.sub(r"#{1,6}\s*",        "",    reply)
+    reply = re.sub(r"\n{3,}",           "\n\n", reply)
+    reply = reply.strip().lstrip(",. ")
+
+    # fix numbered lists: "1. Name"  newline before each item
+    reply = re.sub(r"(?<!\n)(\d+\.)\s+", r"\n\1 ", reply)
+    return reply.strip()
 
 SYSTEM_PROMPT = """\
-You are Kalookan, the AI assistant of the Roman Catholic Diocese of Kalookan, Philippines.
+You are Kalookan, the official AI assistant of the Roman Catholic Diocese of Kalookan, Philippines.
+You speak like a warm, knowledgeable parish staff member — direct, pastoral, never robotic.
 
-You are warm, pastoral, and direct — like a knowledgeable parish staff member.
+ABSOLUTE RULES — follow these without exception:
+1. Never say "the context", "the database", "the provided information", "not listed in", "not mentioned in", or any phrase that reveals you are working from a document. You simply know this or you don't.
+2. Never use **, *, #, or markdown of any kind. Plain text only.
+3. When listing priests, parishes, schools, or any named items — write each one on its own line with a number. Never truncate a list. Never say "and more" or "among others".
+4. Never cut off mid-sentence. Complete every thought.
+5. Short replies like "yes", "San Roque", or "Sunday" are follow-up answers — treat them as such.
+6. Only ask a clarifying question when the query is genuinely impossible to answer without it.
+7. If you truly have no information on a diocese-specific detail, say exactly: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information."
+8. Never add that fallback phrase unless you genuinely have nothing. If partial information exists, give it.
+9. You may respond in Filipino or Tagalog if the user writes in Filipino.
+10. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
 
-RULES:
-- Answer diocese questions using ONLY the CONTEXT below. Never invent diocesan facts.
-- Answer Catholic faith and general knowledge questions from your own knowledge.
-- Never reference "the context", "the database", or any system internals.
-- Never use **, *, #, or any markdown. Write in plain flowing sentences.
-- When listing items such as priests, parishes, or locations — list ALL of them found in the context, never truncate or say "and more".
-- Short follow-up replies like "yes", "San Roque", or "Sunday" are answers to your last question — respond accordingly, never repeat the question.
-- Only ask a follow-up when the question is genuinely too vague to answer.
-- Give complete answers. Never cut off mid-sentence. If listing names or locations, include every single one present in the context.
-- If a diocese-specific detail is missing say: "I don't have that detail right now. Please contact the Diocese of Kalookan directly."
-- You may respond in Filipino or Tagalog if the user writes in Filipino.
-
-CONTEXT:
+DIOCESE INFORMATION:
 {context}"""
 
 class ChatRequest(BaseModel):
