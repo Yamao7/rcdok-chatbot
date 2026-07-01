@@ -1,20 +1,13 @@
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from groq import Groq, RateLimitError
 from rank_bm25 import BM25Okapi
 import os, re, json, time, glob, requests as req_lib
 
-
 app = FastAPI(title="RCDoK Chatbot API")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-@app.get("/")
-def index():
-    return FileResponse("static/index.html")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,8 +19,8 @@ app.add_middleware(
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL  = "llama-3.1-8b-instant"
 
-MAX_CONTEXT_CHARS = 2400
-MAX_TOKENS_OUT    = 250
+MAX_CONTEXT_CHARS = 3500
+MAX_TOKENS_OUT    = 500
 MAX_HISTORY_TURNS = 4
 
 print("Loading knowledge base...")
@@ -81,7 +74,7 @@ def retrieve(query: str, history: list) -> str:
             break
         chunks.append(text)
         total += len(text)
-        if len(chunks) >= 3:
+        if len(chunks) >= 5:
             break
 
     return "\n\n---\n\n".join(chunks)
@@ -121,6 +114,8 @@ def clean(reply: str) -> str:
             low   = reply.lower()
     reply = re.sub(r"\*\*?(.*?)\*\*?", r"\1", reply)
     reply = re.sub(r"#{1,6}\s*", "", reply)
+    reply = re.sub(r"(\d+)\.\s+", r"\n\1. ", reply)
+    reply = re.sub(r"\n{3,}", "\n\n", reply)
     return reply.strip().lstrip(",. ")
 
 SYSTEM_PROMPT = """\
@@ -133,9 +128,10 @@ RULES:
 - Answer Catholic faith and general knowledge questions from your own knowledge.
 - Never reference "the context", "the database", or any system internals.
 - Never use **, *, #, or any markdown. Write in plain flowing sentences.
+- When listing items such as priests, parishes, or locations — list ALL of them found in the context, never truncate or say "and more".
 - Short follow-up replies like "yes", "San Roque", or "Sunday" are answers to your last question — respond accordingly, never repeat the question.
 - Only ask a follow-up when the question is genuinely too vague to answer.
-- Keep answers concise. For diocese details, include all relevant facts you have.
+- Give complete answers. Never cut off mid-sentence. If listing names or locations, include every single one present in the context.
 - If a diocese-specific detail is missing say: "I don't have that detail right now. Please contact the Diocese of Kalookan directly."
 - You may respond in Filipino or Tagalog if the user writes in Filipino.
 
@@ -239,3 +235,11 @@ async def receive_message(req: Request):
 @app.get("/health")
 def health():
     return {"status": "ok", "model": MODEL, "docs_indexed": len(_docs)}
+
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/")
+    def index():
+        return FileResponse(os.path.join(static_dir, "index.html"))
