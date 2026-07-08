@@ -24,7 +24,7 @@ MAX_TOKENS_OUT    = 650
 MAX_HISTORY_TURNS = 4
 
 print("Loading knowledge base...")
-KB_DIR = os.path.join(os.path.dirname(__file__), "knowledge_base")
+KB_DIR = os.path.join(os.path.dirname(__file__), "cleaned_knowledge_base")
 _docs: list[dict] = []
 
 for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
