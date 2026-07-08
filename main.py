@@ -18,15 +18,15 @@ app.add_middleware(
 )
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL  = "llama-3.1-8b-instant"
+MODEL  = "openai/gpt-oss-120b"
 
 MAX_CONTEXT_CHARS = 3000
 MAX_CHARS_PER_DOC = 900
 MAX_DOCS_RETURNED = 4
-MAX_TOKENS_OUT    = 400
+MAX_TOKENS_OUT    = 700
 MAX_HISTORY_TURNS = 4
 
-# ── knowledge base / BM25 index ───────────────────
+# ── knowledge base / bm25 index ───────────────────
 print("Loading knowledge base...")
 KB_DIR = os.path.join(os.path.dirname(__file__), "cleaned_knowledge_base")
 _docs: list[dict] = []
@@ -66,7 +66,28 @@ QUERY_EXPAND = {
     "history":          "history founded established year diocese",
 }
 
+# queries that are meaningless without a specific parish name —
+# if no parish name is present, let the model ask instead of guessing
+VAGUE_WITHOUT_PARISH = {
+    "mass schedule", "mass schedules", "schedule of mass", "confession hours",
+    "parish office", "parish priest", "parochial vicar", "contact number",
+    "church schedule",
+}
+
+def is_vague_parish_query(query: str) -> bool:
+    q = query.lower()
+    if not any(phrase in q for phrase in VAGUE_WITHOUT_PARISH):
+        return False
+    for doc in _docs:
+        parish_words = [w for w in re.findall(r"\w+", doc["name"].lower()) if len(w) > 3]
+        if parish_words and any(w in q for w in parish_words):
+            return False
+    return True
+
 def retrieve(query: str, history: list) -> str:
+    if is_vague_parish_query(query):
+        return ""
+
     query_lower = query.lower()
     expanded    = query
     for key, expansion in QUERY_EXPAND.items():
@@ -102,7 +123,7 @@ def retrieve(query: str, history: list) -> str:
 
     return "\n\n---\n\n".join(chunks)
 
-# ── Groq call ──────────────────────────────────────
+# ── groq call ──────────────────────────────────────
 def groq_call(messages: list, stream: bool = False):
     for attempt in range(4):
         try:
@@ -152,11 +173,13 @@ ABSOLUTE RULES — follow these without exception:
 3. When listing priests, parishes, schools, or any named items — put each item on its own line, prefixed with a number like "1. ". Never put multiple items on the same line. Never truncate a list. Never say "and more" or "among others" — list everything given to you.
 4. Never cut off mid-sentence. Complete every thought.
 5. Short replies like "yes", "San Roque", or "Sunday" are follow-up answers — treat them as such.
-6. Only ask a clarifying question when the query is genuinely impossible to answer without it.
-7. If you truly have no information on a diocese-specific detail, say exactly: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information."
-8. Never add that fallback phrase unless you genuinely have nothing. If partial information exists, give it in full.
-9. You may respond in Filipino or Tagalog if the user writes in Filipino.
-10. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
+6. If asked about mass schedule, confession hours, parish priest, parochial vicar, contact number, or church schedule WITHOUT a specific parish named, always ask which parish first. Never guess or pick a parish yourself.
+7. Only ask a clarifying question when the query is genuinely impossible to answer without it — for anything else, answer directly.
+8. If you truly have no information on a diocese-specific detail, say exactly: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information."
+9. Never add that fallback phrase unless you genuinely have nothing. If partial information exists, give it in full.
+10. Never invent specific times, numbers, addresses, or schedules. If exact figures are not in the DIOCESE INFORMATION below, say you don't have that detail — never estimate or guess numbers to sound helpful.
+11. You may respond in Filipino or Tagalog if the user writes in Filipino.
+12. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
 
 DIOCESE INFORMATION:
 {context}"""
@@ -195,7 +218,7 @@ async def chat(request: ChatRequest):
 
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
-# ── messenger webhook (unprocessed) ──────────────────────────────
+# ── messenger webhook ──────────────────────────────
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
 
