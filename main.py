@@ -7,6 +7,7 @@ from groq import Groq, RateLimitError
 from rank_bm25 import BM25Okapi
 import os, re, json, time, glob, requests as req_lib
 
+# ── app setup ──────────────────────────────────────
 app = FastAPI(title="RCDoK Chatbot API")
 
 app.add_middleware(
@@ -17,16 +18,18 @@ app.add_middleware(
 )
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL  = "openai/gpt-oss-120b"
+MODEL  = "llama-3.1-8b-instant"
 
-MAX_CONTEXT_CHARS = 6000
-MAX_TOKENS_OUT    = 650
+MAX_CONTEXT_CHARS = 3000
+MAX_CHARS_PER_DOC = 900
+MAX_DOCS_RETURNED = 4
+MAX_TOKENS_OUT    = 400
 MAX_HISTORY_TURNS = 4
-MAX_DOCS_RETURNED = 5
 
+# ── knowledge base / BM25 index ───────────────────
 print("Loading knowledge base...")
 KB_DIR = os.path.join(os.path.dirname(__file__), "cleaned_knowledge_base")
-_docs: list[dict] = []   # one entry per WHOLE file — no chunking
+_docs: list[dict] = []
 
 for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
     try:
@@ -85,7 +88,8 @@ def retrieve(query: str, history: list) -> str:
         if scores[idx] < 0.001:
             break
         text = _docs[idx]["text"]
-        # whole document — include entirely if it fits, else truncate this single doc only
+        if len(text) > MAX_CHARS_PER_DOC:
+            text = text[:MAX_CHARS_PER_DOC]
         if total + len(text) > MAX_CONTEXT_CHARS:
             remaining = MAX_CONTEXT_CHARS - total
             if remaining > 300:
@@ -98,6 +102,7 @@ def retrieve(query: str, history: list) -> str:
 
     return "\n\n---\n\n".join(chunks)
 
+# ── Groq call ──────────────────────────────────────
 def groq_call(messages: list, stream: bool = False):
     for attempt in range(4):
         try:
@@ -117,6 +122,7 @@ def groq_call(messages: list, stream: bool = False):
         except Exception:
             raise
 
+# ── reply cleaning ─────────────────────────────────
 _LEAK_RE = re.compile(
     r'[^.!?]*(?:based on the context|according to the context|the provided text|'
     r'the context provided|in the information given|the knowledge base|provided context|'
@@ -131,13 +137,8 @@ def clean(reply: str) -> str:
     reply = _LEAK_RE.sub("", reply)
     reply = re.sub(r"\*\*?(.*?)\*\*?", r"\1", reply)
     reply = re.sub(r"#{1,6}\s*", "", reply)
-
-    # Normalize dash/bullet markers into their own line
     reply = re.sub(r"(?<!\n)[ \t]*[•\-–]\s+(?=[A-Z0-9])", r"\n- ", reply)
-
-    # Fix numbered lists: force each "1." onto its own line
     reply = re.sub(r"(?<!\n)(\d+\.)\s+", r"\n\1 ", reply)
-
     reply = re.sub(r"\n{3,}", "\n\n", reply)
     return reply.strip().lstrip(",. ")
 
@@ -166,6 +167,7 @@ class ChatRequest(BaseModel):
 
 _messenger_history: dict[str, list] = {}
 
+# ── web chat ───────────────────────────────────────
 @app.post("/chat")
 async def chat(request: ChatRequest):
     context  = retrieve(request.message, request.history)
@@ -193,6 +195,7 @@ async def chat(request: ChatRequest):
 
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")
 
+# ── messenger webhook (unprocessed) ──────────────────────────────
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 VERIFY_TOKEN      = os.environ.get("VERIFY_TOKEN", "")
 
@@ -258,6 +261,7 @@ async def receive_message(req: Request):
 def health():
     return {"status": "ok", "model": MODEL, "docs_indexed": len(_docs)}
 
+# ── static frontend ────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
