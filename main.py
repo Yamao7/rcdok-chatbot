@@ -20,10 +20,9 @@ app.add_middleware(
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL  = "openai/gpt-oss-120b"
 
-MAX_CONTEXT_CHARS = 3000
-MAX_CHARS_PER_DOC = 900
+MAX_CONTEXT_CHARS = 3500
 MAX_DOCS_RETURNED = 4
-MAX_TOKENS_OUT    = 700
+MAX_TOKENS_OUT    = 1100
 MAX_HISTORY_TURNS = 4
 
 # ── knowledge base / bm25 index ───────────────────
@@ -66,8 +65,37 @@ QUERY_EXPAND = {
     "history":          "history founded established year diocese",
 }
 
-# queries that are meaningless without a specific parish name —
-# if no parish name is present, let the model ask instead of guessing
+# words too generic to count as identifying a specific parish
+GENERIC_PARISH_WORDS = {
+    "cleaned","parish","parishes","quasi","vicariate","diocesan","shrine",
+    "of","and","the","san","sta","sto","de","los","las","our","lady",
+}
+
+def short_name(doc_name: str) -> str:
+    parts = doc_name.split(" - ")
+    return parts[-1] if parts else doc_name
+
+def significant_words(name: str) -> list:
+    words = re.findall(r"\w+", name.lower())
+    return [w for w in words if w not in GENERIC_PARISH_WORDS and len(w) > 2]
+
+_parish_sig = [(doc, significant_words(short_name(doc["name"]))) for doc in _docs]
+
+def find_named_parish(query: str):
+    """direct lookup — matches a parish by name regardless of conversation noise"""
+    q_words = set(re.findall(r"\w+", query.lower()))
+    best, best_score = None, 0
+    for doc, sig in _parish_sig:
+        if not sig:
+            continue
+        overlap = len(set(sig) & q_words)
+        ratio   = overlap / len(sig)
+        if overlap >= 1 and (ratio >= 0.6 or overlap >= 2):
+            if overlap > best_score:
+                best_score, best = overlap, doc
+    return best
+
+# phrases that need a named parish to mean anything
 VAGUE_WITHOUT_PARISH = {
     "mass schedule", "mass schedules", "schedule of mass", "confession hours",
     "parish office", "parish priest", "parochial vicar", "contact number",
@@ -76,18 +104,26 @@ VAGUE_WITHOUT_PARISH = {
 
 def is_vague_parish_query(query: str) -> bool:
     q = query.lower()
-    if not any(phrase in q for phrase in VAGUE_WITHOUT_PARISH):
-        return False
-    for doc in _docs:
-        parish_words = [w for w in re.findall(r"\w+", doc["name"].lower()) if len(w) > 3]
-        if parish_words and any(w in q for w in parish_words):
-            return False
-    return True
+    return any(phrase in q for phrase in VAGUE_WITHOUT_PARISH)
+
+ANY_FALLBACK_TRIGGERS = {"any", "kalookan", "cathedral", "main parish", "any parish", "some parish"}
 
 def retrieve(query: str, history: list) -> str:
-    if is_vague_parish_query(query):
-        return ""
+    # 1. try a direct named-parish match first — bypasses history noise entirely
+    matched = find_named_parish(query)
+    if matched:
+        return matched["text"][:MAX_CONTEXT_CHARS]
 
+    # 2. vague schedule/contact-type question with no parish named
+    if is_vague_parish_query(query):
+        q_lower = query.lower()
+        if any(trigger in q_lower for trigger in ANY_FALLBACK_TRIGGERS):
+            cathedral = next((d for d in _docs if "cathedral" in d["name"].lower()), None)
+            if cathedral:
+                return cathedral["text"][:MAX_CONTEXT_CHARS]
+        return ""  # let the model ask which parish
+
+    # 3. normal bm25 retrieval for everything else
     query_lower = query.lower()
     expanded    = query
     for key, expansion in QUERY_EXPAND.items():
@@ -95,9 +131,7 @@ def retrieve(query: str, history: list) -> str:
             expanded = query + " " + expansion
             break
 
-    tail     = " ".join(t.get("content", "") for t in history[-4:])
-    enriched = (expanded + " " + tail).strip()
-    tokens   = [w for w in re.findall(r"\w+", enriched.lower()) if w not in STOP and len(w) > 2]
+    tokens = [w for w in re.findall(r"\w+", expanded.lower()) if w not in STOP and len(w) > 2]
     if not tokens:
         return ""
 
@@ -109,8 +143,6 @@ def retrieve(query: str, history: list) -> str:
         if scores[idx] < 0.001:
             break
         text = _docs[idx]["text"]
-        if len(text) > MAX_CHARS_PER_DOC:
-            text = text[:MAX_CHARS_PER_DOC]
         if total + len(text) > MAX_CONTEXT_CHARS:
             remaining = MAX_CONTEXT_CHARS - total
             if remaining > 300:
@@ -165,21 +197,20 @@ def clean(reply: str) -> str:
 
 SYSTEM_PROMPT = """\
 You are Kalookan, the official AI assistant of the Roman Catholic Diocese of Kalookan, Philippines.
-You speak like a warm, knowledgeable parish staff member — direct, pastoral, never robotic.
+You speak like a warm, patient parish staff member helping any visitor, including elderly or unfamiliar users — direct, pastoral, never robotic, never curt.
 
 ABSOLUTE RULES — follow these without exception:
 1. Never say "the context", "the database", "the provided information", "not listed in", "not mentioned in", or any phrase that reveals you are working from a document. You simply know this or you don't.
 2. Never use **, *, #, or markdown of any kind. Plain text only.
-3. When listing priests, parishes, schools, or any named items — put each item on its own line, prefixed with a number like "1. ". Never put multiple items on the same line. Never truncate a list. Never say "and more" or "among others" — list everything given to you.
-4. Never cut off mid-sentence. Complete every thought.
-5. Short replies like "yes", "San Roque", or "Sunday" are follow-up answers — treat them as such.
-6. If asked about mass schedule, confession hours, parish priest, parochial vicar, contact number, or church schedule WITHOUT a specific parish named, always ask which parish first. Never guess or pick a parish yourself.
-7. Only ask a clarifying question when the query is genuinely impossible to answer without it — for anything else, answer directly.
-8. If you truly have no information on a diocese-specific detail, say exactly: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information."
-9. Never add that fallback phrase unless you genuinely have nothing. If partial information exists, give it in full.
-10. Never invent specific times, numbers, addresses, or schedules. If exact figures are not in the DIOCESE INFORMATION below, say you don't have that detail — never estimate or guess numbers to sound helpful.
-11. You may respond in Filipino or Tagalog if the user writes in Filipino.
-12. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
+3. When listing priests, parishes, schools, or any named items — put each item on its own line, prefixed with a number like "1. ". Never truncate a list, never say "and more" — write out every single one given to you, no matter how long the list is.
+4. Never cut off mid-sentence or mid-list. Complete every thought and every list fully.
+5. Short replies like "yes", "San Roque", or "Sunday" are follow-up answers to your last question — treat them as such, never repeat the question.
+6. If asked about mass schedule, confession hours, parish priest, or contact info without a parish named, and you have no specific parish information provided below, kindly ask which parish they mean, and mention as an example that you can share San Roque Cathedral's schedule if they are not sure which parish serves their area.
+7. Be forgiving of vague, casual, or imprecise questions — never refuse or give up after one unclear reply. Gently guide the person toward an answer instead of repeating the same clarifying question.
+8. If you truly have no information on a diocese-specific detail even after trying to help, say: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information." Use this only as a last resort, never as a first response to a vague question.
+9. Never invent specific times, numbers, addresses, or schedules. If exact figures are not in the DIOCESE INFORMATION below, say so plainly rather than guessing.
+10. You may respond in Filipino or Tagalog if the user writes in Filipino.
+11. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
 
 DIOCESE INFORMATION:
 {context}"""
