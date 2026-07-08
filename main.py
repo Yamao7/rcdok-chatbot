@@ -17,34 +17,30 @@ app.add_middleware(
 )
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-MODEL  = "llama-3.1-8b-instant"
+MODEL  = "openai/gpt-oss-120b"
 
-MAX_CONTEXT_CHARS = 4000
+MAX_CONTEXT_CHARS = 6000
 MAX_TOKENS_OUT    = 650
 MAX_HISTORY_TURNS = 4
+MAX_DOCS_RETURNED = 5
 
 print("Loading knowledge base...")
 KB_DIR = os.path.join(os.path.dirname(__file__), "cleaned_knowledge_base")
-_docs: list[dict] = []
+_docs: list[dict] = []   # one entry per WHOLE file — no chunking
 
 for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
     try:
         with open(path, encoding="utf-8") as f:
             raw = f.read().strip()
         name = os.path.splitext(os.path.basename(path))[0]
-        # larger chunks (500 chars, 100 overlap) so names/titles stay together
-        step = 500
-        size = 1000
-        for i in range(0, max(1, len(raw) - 100), step):
-            chunk = raw[i : i + size].strip()
-            if len(chunk) > 40:
-                _docs.append({"text": chunk, "name": name})
+        if raw:
+            _docs.append({"text": raw, "name": name})
     except Exception as e:
         print(f"  skipped {path}: {e}")
 
 _tokenized = [re.findall(r"\w+", d["text"].lower()) for d in _docs]
 _bm25      = BM25Okapi(_tokenized)
-print(f"BM25 ready — {len(_docs)} chunks from {len(set(d['name'] for d in _docs))} documents.")
+print(f"BM25 ready — {len(_docs)} whole documents indexed.")
 
 STOP = {
     "the","a","an","is","are","what","who","where","when","how","does","do",
@@ -58,10 +54,13 @@ QUERY_EXPAND = {
     "priests":          "clergy fr father bishop vicar rector diocesan",
     "diocesan priests": "clergy fr father bishop vicar rector diocesan",
     "parish priests":   "clergy fr father bishop vicar rector parish",
-    "mission centers":  "missions center location address headquarters",
-    "mission":          "missions center location address headquarters",
+    "mission centers":  "missions center location address headquarters station",
+    "mission":          "missions center location address headquarters station",
+    "mission stations": "missions station chapel location",
     "schools":          "school member education college academy",
     "cemeteries":       "cemetery columbary ossuary burial",
+    "coat of arms":     "coat arms crest emblem heraldry symbol",
+    "history":          "history founded established year diocese",
 }
 
 def retrieve(query: str, history: list) -> str:
@@ -81,20 +80,20 @@ def retrieve(query: str, history: list) -> str:
     scores  = _bm25.get_scores(tokens)
     indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
 
-    seen, chunks, total = set(), [], 0
+    chunks, total = [], 0
     for idx in indices:
         if scores[idx] < 0.001:
             break
         text = _docs[idx]["text"]
-        key  = text[:60]
-        if key in seen:
-            continue
-        seen.add(key)
+        # whole document — include entirely if it fits, else truncate this single doc only
         if total + len(text) > MAX_CONTEXT_CHARS:
+            remaining = MAX_CONTEXT_CHARS - total
+            if remaining > 300:
+                chunks.append(text[:remaining])
             break
         chunks.append(text)
         total += len(text)
-        if len(chunks) >= 6:
+        if len(chunks) >= MAX_DOCS_RETURNED:
             break
 
     return "\n\n---\n\n".join(chunks)
@@ -118,7 +117,6 @@ def groq_call(messages: list, stream: bool = False):
         except Exception:
             raise
 
-# strip entire sentence if it contains a leak phrase cleaner than substring removal
 _LEAK_RE = re.compile(
     r'[^.!?]*(?:based on the context|according to the context|the provided text|'
     r'the context provided|in the information given|the knowledge base|provided context|'
@@ -132,13 +130,16 @@ _LEAK_RE = re.compile(
 def clean(reply: str) -> str:
     reply = _LEAK_RE.sub("", reply)
     reply = re.sub(r"\*\*?(.*?)\*\*?", r"\1", reply)
-    reply = re.sub(r"#{1,6}\s*",        "",    reply)
-    reply = re.sub(r"\n{3,}",           "\n\n", reply)
-    reply = reply.strip().lstrip(",. ")
+    reply = re.sub(r"#{1,6}\s*", "", reply)
 
-    # fix numbered lists: "1. Name"  newline before each item
-    reply = re.sub(r"(?<!\n)(\d+\.) +", r"\n\1 ", reply)
-    return reply.strip()
+    # Normalize dash/bullet markers into their own line
+    reply = re.sub(r"(?<!\n)[ \t]*[•\-–]\s+(?=[A-Z0-9])", r"\n- ", reply)
+
+    # Fix numbered lists: force each "1." onto its own line
+    reply = re.sub(r"(?<!\n)(\d+\.)\s+", r"\n\1 ", reply)
+
+    reply = re.sub(r"\n{3,}", "\n\n", reply)
+    return reply.strip().lstrip(",. ")
 
 SYSTEM_PROMPT = """\
 You are Kalookan, the official AI assistant of the Roman Catholic Diocese of Kalookan, Philippines.
@@ -147,12 +148,12 @@ You speak like a warm, knowledgeable parish staff member — direct, pastoral, n
 ABSOLUTE RULES — follow these without exception:
 1. Never say "the context", "the database", "the provided information", "not listed in", "not mentioned in", or any phrase that reveals you are working from a document. You simply know this or you don't.
 2. Never use **, *, #, or markdown of any kind. Plain text only.
-3. When listing priests, parishes, schools, or any named items — write each one on its own line with a number. Never truncate a list. Never say "and more" or "among others".
+3. When listing priests, parishes, schools, or any named items — put each item on its own line, prefixed with a number like "1. ". Never put multiple items on the same line. Never truncate a list. Never say "and more" or "among others" — list everything given to you.
 4. Never cut off mid-sentence. Complete every thought.
 5. Short replies like "yes", "San Roque", or "Sunday" are follow-up answers — treat them as such.
 6. Only ask a clarifying question when the query is genuinely impossible to answer without it.
 7. If you truly have no information on a diocese-specific detail, say exactly: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information."
-8. Never add that fallback phrase unless you genuinely have nothing. If partial information exists, give it.
+8. Never add that fallback phrase unless you genuinely have nothing. If partial information exists, give it in full.
 9. You may respond in Filipino or Tagalog if the user writes in Filipino.
 10. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
 
