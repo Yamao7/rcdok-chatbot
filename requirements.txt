@@ -1,10 +1,9 @@
-rank-bm25
-groq
 fastapi
 uvicorn[standard]
+groq
+rank-bm25
 requests
 beautifulsoup4
 pydantic
-aiofiles
 huggingface_hub
 numpy

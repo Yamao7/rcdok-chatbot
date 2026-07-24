@@ -5,7 +5,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from groq import Groq, RateLimitError
 from rank_bm25 import BM25Okapi
-import os, re, json, time, glob, unicodedata, requests as req_lib
+from huggingface_hub import InferenceClient
+import os, re, json, time, glob, requests as req_lib
+import numpy as np
 
 # ── app setup ──────────────────────────────────────
 app = FastAPI(title="RCDoK Chatbot API")
@@ -24,59 +26,58 @@ MAX_CONTEXT_CHARS = 3500
 MAX_DOCS_RETURNED = 4
 MAX_TOKENS_OUT    = 1100
 MAX_HISTORY_TURNS = 4
-TITLE_BOOST_WEIGHT = 2.0
 
-# ── text normalization helpers ────────────────────
-def normalize(text: str) -> str:
-    """Strip accents for tokenizing/matching only — never used for display text."""
-    nfkd = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in nfkd if not unicodedata.combining(c))
+# ── hugging face embeddings (hybrid search) ───────
+HF_TOKEN  = os.environ.get("HF_TOKEN")
+HF_MODEL  = "sentence-transformers/all-MiniLM-L6-v2"
+hf_client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
 
-def tokenize(text: str) -> list:
-    return re.findall(r"\w+", normalize(text).lower())
+print("Loading precomputed embeddings...")
+_embeddings_cache: dict = {}
+_embeddings_path = os.path.join(os.path.dirname(__file__), "embeddings_cache.json")
 
-HEADER_RE = re.compile(r"^PAGE:.*\n?SOURCE:.*\n*", re.IGNORECASE)
+if os.path.exists(_embeddings_path):
+    with open(_embeddings_path, encoding="utf-8") as f:
+        _embeddings_cache = json.load(f)
+    print(f"Loaded {len(_embeddings_cache)} precomputed embeddings.")
+else:
+    print("No embeddings_cache.json found — hybrid search disabled, BM25 only.")
+
+def cosine_similarity(a: list, b: list) -> float:
+    a, b = np.array(a), np.array(b)
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+def get_query_embedding(query: str):
+    if not HF_TOKEN or not _embeddings_cache:
+        return None
+    try:
+        vector = hf_client.feature_extraction(query, model=HF_MODEL)
+        return vector.tolist() if hasattr(vector, "tolist") else vector
+    except Exception as e:
+        print(f"HF embedding failed, falling back to BM25 only: {e}")
+        return None
 
 # ── knowledge base / bm25 index ───────────────────
 print("Loading knowledge base...")
 KB_DIR = os.path.join(os.path.dirname(__file__), "cleaned_knowledge_base")
 _docs: list[dict] = []
 
-# roster-style files get split into one chunk per person instead of
-# being indexed as one giant block — otherwise a single-priest query
-# returns the entire 40-person directory
-ROSTER_FILES = {"(cleaned) Clergy - Diocesan", "(cleaned) Clergy - Religious"}
-
-def chunk_roster(text: str, doc_name: str) -> list:
-    entries = re.split(r"\n\n(?=\S)", text.strip())
-    chunks = []
-    for entry in entries:
-        entry = entry.strip()
-        if len(entry) > 20:
-            chunks.append({"text": entry, "name": doc_name})
-    return chunks
-
 for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
     try:
         with open(path, encoding="utf-8") as f:
             raw = f.read().strip()
-        raw = HEADER_RE.sub("", raw)  # strip PAGE:/SOURCE: header lines
         name = os.path.splitext(os.path.basename(path))[0]
-        if not raw:
-            continue
-        if name in ROSTER_FILES:
-            _docs.extend(chunk_roster(raw, name))
-        else:
+        if raw:
             _docs.append({"text": raw, "name": name})
     except Exception as e:
         print(f"  skipped {path}: {e}")
 
-_tokenized = [tokenize(d["text"]) for d in _docs]
-# b lowered from default 0.75 — our docs vary a lot in length (mission
-# station blurbs vs. full parish histories) and length here reflects
-# real content richness, not padding, so we don't want to penalize it hard
-_bm25 = BM25Okapi(_tokenized, k1=1.2, b=0.4)
-print(f"BM25 ready — {len(_docs)} documents indexed ({len(ROSTER_FILES)} roster files chunked).")
+_tokenized = [re.findall(r"\w+", d["text"].lower()) for d in _docs]
+_bm25      = BM25Okapi(_tokenized)
+print(f"BM25 ready — {len(_docs)} whole documents indexed.")
 
 STOP = {
     "the","a","an","is","are","what","who","where","when","how","does","do",
@@ -103,7 +104,6 @@ QUERY_EXPAND = {
 GENERIC_PARISH_WORDS = {
     "cleaned","parish","parishes","quasi","vicariate","diocesan","shrine",
     "of","and","the","san","sta","sto","de","los","las","our","lady",
-    "clergy","religious",  # exclude roster file names from parish matching
 }
 
 def short_name(doc_name: str) -> str:
@@ -111,72 +111,79 @@ def short_name(doc_name: str) -> str:
     return parts[-1] if parts else doc_name
 
 def significant_words(name: str) -> list:
-    words = re.findall(r"\w+", normalize(name).lower())
+    words = re.findall(r"\w+", name.lower())
     return [w for w in words if w not in GENERIC_PARISH_WORDS and len(w) > 2]
 
-# roster files are excluded here — they aren't named parishes, and letting
-# "clergy" or "diocesan" match would incorrectly short-circuit into
-# find_named_parish and return only one priest instead of the full context
-_parish_sig = [
-    (doc, significant_words(short_name(doc["name"])))
-    for doc in _docs
-    if doc["name"] not in ROSTER_FILES
-]
+_parish_sig = [(doc, significant_words(short_name(doc["name"]))) for doc in _docs]
 
 def find_named_parish(query: str):
-    """direct lookup — matches a parish by name regardless of conversation noise"""
-    q_words = set(tokenize(query))
-    best, best_score = None, 0
+    """direct lookup — ranks by ratio (specificity) first, overlap as tiebreaker,
+    so a short exact match isn't beaten by a longer noisy name on raw count alone"""
+    q_words = set(re.findall(r"\w+", query.lower()))
+    candidates = []
     for doc, sig in _parish_sig:
         if not sig:
             continue
         overlap = len(set(sig) & q_words)
         ratio   = overlap / len(sig)
         if overlap >= 1 and (ratio >= 0.6 or overlap >= 2):
-            if overlap > best_score:
-                best_score, best = overlap, doc
-    return best
+            candidates.append((doc, ratio, overlap))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c[1], c[2]), reverse=True)
+    return candidates[0][0]
 
-# phrases that need a named parish to mean anything
 VAGUE_WITHOUT_PARISH = {
     "mass schedule", "mass schedules", "schedule of mass", "confession hours",
     "parish office", "parish priest", "parochial vicar", "contact number",
-    "church schedule",
+    "church schedule", "confession schedule", "office hours",
 }
 
 def is_vague_parish_query(query: str) -> bool:
-    q = query.lower()
-    return any(phrase in q for phrase in VAGUE_WITHOUT_PARISH)
+    q     = query.lower()
+    words = re.findall(r"\w+", q)
+
+    if any(phrase in q for phrase in VAGUE_WITHOUT_PARISH):
+        return True
+
+    has_mass = "mass" in words or "misa" in words
+    has_time = any(w in words for w in ("schedule", "schedules", "time", "times", "when", "oras"))
+    if has_mass and has_time:
+        return True
+
+    if "confession" in words and has_time:
+        return True
+
+    if len(words) <= 4 and any(w in words for w in ("priest", "father", "fr")):
+        return True
+    if len(words) <= 3 and any(w in words for w in ("schedule", "mass")):
+        return True
+
+    return False
 
 ANY_FALLBACK_TRIGGERS = {"any", "kalookan", "cathedral", "main parish", "any parish", "some parish"}
 
-def title_boosted_scores(tokens: list) -> list:
-    """Base BM25 scores, boosted when query terms also appear in the doc's own title."""
-    scores = list(_bm25.get_scores(tokens))
-    token_set = set(tokens)
-    for i, doc in enumerate(_docs):
-        title_words = set(tokenize(doc["name"]))
-        overlap = len(token_set & title_words)
-        if overlap:
-            scores[i] += overlap * TITLE_BOOST_WEIGHT
-    return scores
+THEOLOGY_MARKERS = {
+    "explain", "meaning of", "what does", "why do", "doctrine",
+    "teaching of", "theology of", "significance of", "catechism",
+}
 
 def retrieve(query: str, history: list) -> str:
-    # 1. try a direct named-parish match first — bypasses history noise entirely
-    matched = find_named_parish(query)
+    q_lower = query.lower()
+
+    matched = None if any(m in q_lower for m in THEOLOGY_MARKERS) else find_named_parish(query)
     if matched:
         return matched["text"][:MAX_CONTEXT_CHARS]
 
     # 2. vague schedule/contact-type question with no parish named
     if is_vague_parish_query(query):
-        q_lower = query.lower()
         if any(trigger in q_lower for trigger in ANY_FALLBACK_TRIGGERS):
             cathedral = next((d for d in _docs if "cathedral" in d["name"].lower()), None)
             if cathedral:
                 return cathedral["text"][:MAX_CONTEXT_CHARS]
         return ""  # let the model ask which parish
 
-    # 3. normal bm25 retrieval for everything else
+    # 3. hybrid bm25 + embedding retrieval for everything else
     query_lower = query.lower()
     expanded    = query
     for key, expansion in QUERY_EXPAND.items():
@@ -184,26 +191,33 @@ def retrieve(query: str, history: list) -> str:
             expanded = query + " " + expansion
             break
 
-    tokens = [w for w in tokenize(expanded) if w not in STOP and len(w) > 2]
+    tokens = [w for w in re.findall(r"\w+", expanded.lower()) if w not in STOP and len(w) > 2]
     if not tokens:
         return ""
 
-    scores  = title_boosted_scores(tokens)
-    indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    bm25_scores = _bm25.get_scores(tokens)
+    bm25_max    = max(bm25_scores) if max(bm25_scores) > 0 else 1
 
-    chunks, total, seen_names = [], 0, set()
-    for idx in indices:
-        if scores[idx] < 0.001:
+    query_vec = get_query_embedding(query)
+
+    combined = []
+    for idx, doc in enumerate(_docs):
+        bm25_norm = bm25_scores[idx] / bm25_max
+
+        emb_sim = 0.0
+        if query_vec and doc["name"] in _embeddings_cache:
+            emb_sim = cosine_similarity(query_vec, _embeddings_cache[doc["name"]])
+
+        final_score = (bm25_norm * 0.5) + (emb_sim * 0.5)
+        combined.append((idx, final_score))
+
+    combined.sort(key=lambda x: x[1], reverse=True)
+
+    chunks, total = [], 0
+    for idx, score in combined:
+        if score < 0.05:
             break
-        doc = _docs[idx]
-        if doc["name"] in ROSTER_FILES:
-            key = doc["name"]
-            count = sum(1 for n in seen_names if n == key)
-            if count >= 2:
-                continue
-            seen_names.add(key)
-
-        text = doc["text"]
+        text = _docs[idx]["text"]
         if total + len(text) > MAX_CONTEXT_CHARS:
             remaining = MAX_CONTEXT_CHARS - total
             if remaining > 300:
@@ -269,7 +283,7 @@ ABSOLUTE RULES — follow these without exception:
 6. If asked about mass schedule, confession hours, parish priest, or contact info without a parish named, and you have no specific parish information provided below, kindly ask which parish they mean, and mention as an example that you can share San Roque Cathedral's schedule if they are not sure which parish serves their area.
 7. Be forgiving of vague, casual, or imprecise questions — never refuse or give up after one unclear reply. Gently guide the person toward an answer instead of repeating the same clarifying question.
 8. If you truly have no information on a diocese-specific detail even after trying to help, say: "I don't have that detail right now. You can reach the Diocese of Kalookan directly through their Facebook page or website for the most up-to-date information." Use this only as a last resort, never as a first response to a vague question.
-9. Never invent specific times, numbers, addresses, or schedules. If exact figures are not in the DIOCESE INFORMATION below, say so plainly rather than guessing.
+9. Never invent specific times, numbers, addresses, schedules, prayers, or devotional texts. If exact wording or figures are not in the DIOCESE INFORMATION below, say so plainly rather than guessing or composing your own version.
 10. You may respond in Filipino or Tagalog if the user writes in Filipino.
 11. For Catholic faith and general knowledge questions not specific to the diocese, answer from your own knowledge.
 
@@ -374,7 +388,12 @@ async def receive_message(req: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL, "docs_indexed": len(_docs)}
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "docs_indexed": len(_docs),
+        "embeddings_loaded": len(_embeddings_cache),
+    }
 
 # ── static frontend ────────────────────────────────
 static_dir = os.path.join(os.path.dirname(__file__), "static")
