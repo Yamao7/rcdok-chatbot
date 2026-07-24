@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from groq import Groq, RateLimitError
 from rank_bm25 import BM25Okapi
-import os, re, json, time, glob, requests as req_lib
+import os, re, json, time, glob, unicodedata, requests as req_lib
 
 # ── app setup ──────────────────────────────────────
 app = FastAPI(title="RCDoK Chatbot API")
@@ -24,25 +24,59 @@ MAX_CONTEXT_CHARS = 3500
 MAX_DOCS_RETURNED = 4
 MAX_TOKENS_OUT    = 1100
 MAX_HISTORY_TURNS = 4
+TITLE_BOOST_WEIGHT = 2.0
+
+# ── text normalization helpers ────────────────────
+def normalize(text: str) -> str:
+    """Strip accents for tokenizing/matching only — never used for display text."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+def tokenize(text: str) -> list:
+    return re.findall(r"\w+", normalize(text).lower())
+
+HEADER_RE = re.compile(r"^PAGE:.*\n?SOURCE:.*\n*", re.IGNORECASE)
 
 # ── knowledge base / bm25 index ───────────────────
 print("Loading knowledge base...")
 KB_DIR = os.path.join(os.path.dirname(__file__), "cleaned_knowledge_base")
 _docs: list[dict] = []
 
+# roster-style files get split into one chunk per person instead of
+# being indexed as one giant block — otherwise a single-priest query
+# returns the entire 40-person directory
+ROSTER_FILES = {"(cleaned) Clergy - Diocesan", "(cleaned) Clergy - Religious"}
+
+def chunk_roster(text: str, doc_name: str) -> list:
+    entries = re.split(r"\n\n(?=\S)", text.strip())
+    chunks = []
+    for entry in entries:
+        entry = entry.strip()
+        if len(entry) > 20:
+            chunks.append({"text": entry, "name": doc_name})
+    return chunks
+
 for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
     try:
         with open(path, encoding="utf-8") as f:
             raw = f.read().strip()
+        raw = HEADER_RE.sub("", raw)  # strip PAGE:/SOURCE: header lines
         name = os.path.splitext(os.path.basename(path))[0]
-        if raw:
+        if not raw:
+            continue
+        if name in ROSTER_FILES:
+            _docs.extend(chunk_roster(raw, name))
+        else:
             _docs.append({"text": raw, "name": name})
     except Exception as e:
         print(f"  skipped {path}: {e}")
 
-_tokenized = [re.findall(r"\w+", d["text"].lower()) for d in _docs]
-_bm25      = BM25Okapi(_tokenized)
-print(f"BM25 ready — {len(_docs)} whole documents indexed.")
+_tokenized = [tokenize(d["text"]) for d in _docs]
+# b lowered from default 0.75 — our docs vary a lot in length (mission
+# station blurbs vs. full parish histories) and length here reflects
+# real content richness, not padding, so we don't want to penalize it hard
+_bm25 = BM25Okapi(_tokenized, k1=1.2, b=0.4)
+print(f"BM25 ready — {len(_docs)} documents indexed ({len(ROSTER_FILES)} roster files chunked).")
 
 STOP = {
     "the","a","an","is","are","what","who","where","when","how","does","do",
@@ -69,6 +103,7 @@ QUERY_EXPAND = {
 GENERIC_PARISH_WORDS = {
     "cleaned","parish","parishes","quasi","vicariate","diocesan","shrine",
     "of","and","the","san","sta","sto","de","los","las","our","lady",
+    "clergy","religious",  # exclude roster file names from parish matching
 }
 
 def short_name(doc_name: str) -> str:
@@ -76,14 +111,21 @@ def short_name(doc_name: str) -> str:
     return parts[-1] if parts else doc_name
 
 def significant_words(name: str) -> list:
-    words = re.findall(r"\w+", name.lower())
+    words = re.findall(r"\w+", normalize(name).lower())
     return [w for w in words if w not in GENERIC_PARISH_WORDS and len(w) > 2]
 
-_parish_sig = [(doc, significant_words(short_name(doc["name"]))) for doc in _docs]
+# roster files are excluded here — they aren't named parishes, and letting
+# "clergy" or "diocesan" match would incorrectly short-circuit into
+# find_named_parish and return only one priest instead of the full context
+_parish_sig = [
+    (doc, significant_words(short_name(doc["name"])))
+    for doc in _docs
+    if doc["name"] not in ROSTER_FILES
+]
 
 def find_named_parish(query: str):
     """direct lookup — matches a parish by name regardless of conversation noise"""
-    q_words = set(re.findall(r"\w+", query.lower()))
+    q_words = set(tokenize(query))
     best, best_score = None, 0
     for doc, sig in _parish_sig:
         if not sig:
@@ -108,6 +150,17 @@ def is_vague_parish_query(query: str) -> bool:
 
 ANY_FALLBACK_TRIGGERS = {"any", "kalookan", "cathedral", "main parish", "any parish", "some parish"}
 
+def title_boosted_scores(tokens: list) -> list:
+    """Base BM25 scores, boosted when query terms also appear in the doc's own title."""
+    scores = list(_bm25.get_scores(tokens))
+    token_set = set(tokens)
+    for i, doc in enumerate(_docs):
+        title_words = set(tokenize(doc["name"]))
+        overlap = len(token_set & title_words)
+        if overlap:
+            scores[i] += overlap * TITLE_BOOST_WEIGHT
+    return scores
+
 def retrieve(query: str, history: list) -> str:
     # 1. try a direct named-parish match first — bypasses history noise entirely
     matched = find_named_parish(query)
@@ -131,18 +184,26 @@ def retrieve(query: str, history: list) -> str:
             expanded = query + " " + expansion
             break
 
-    tokens = [w for w in re.findall(r"\w+", expanded.lower()) if w not in STOP and len(w) > 2]
+    tokens = [w for w in tokenize(expanded) if w not in STOP and len(w) > 2]
     if not tokens:
         return ""
 
-    scores  = _bm25.get_scores(tokens)
+    scores  = title_boosted_scores(tokens)
     indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
 
-    chunks, total = [], 0
+    chunks, total, seen_names = [], 0, set()
     for idx in indices:
         if scores[idx] < 0.001:
             break
-        text = _docs[idx]["text"]
+        doc = _docs[idx]
+        if doc["name"] in ROSTER_FILES:
+            key = doc["name"]
+            count = sum(1 for n in seen_names if n == key)
+            if count >= 2:
+                continue
+            seen_names.add(key)
+
+        text = doc["text"]
         if total + len(text) > MAX_CONTEXT_CHARS:
             remaining = MAX_CONTEXT_CHARS - total
             if remaining > 300:

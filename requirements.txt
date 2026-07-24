@@ -6,3 +6,5 @@ requests
 beautifulsoup4
 pydantic
 aiofiles
+huggingface_hub
+numpy
